@@ -21,6 +21,17 @@ import (
 
 const debugEnv = "JSONSCHEMAGODEBUG"
 
+// SchemaProvider is an interface that types can implement to provide their own
+// JSON Schema representation. If a type implements this interface, [For] and
+// [ForType] will use the schema returned by Schema instead of the default
+// reflection-based schema.
+// Types in [ForOptions.TypeSchemas] take precedence over SchemaProvider.
+type SchemaProvider interface {
+	Schema() *Schema
+}
+
+var schemaProviderType = reflect.TypeFor[SchemaProvider]()
+
 // ForOptions are options for the [For] and [ForType] functions.
 type ForOptions struct {
 	// If IgnoreInvalidTypes is true, fields that can't be represented as a JSON
@@ -38,6 +49,11 @@ type ForOptions struct {
 	// in [For]'s documentation.
 	// PropertyOrder defined in these schemas will not be used in [For] or [ForType].
 	TypeSchemas map[reflect.Type]*Schema
+
+	// AdditionalProperties, when true, allows additional properties on struct
+	// schemas. By default, struct schemas disallow additional properties
+	// (additionalProperties is set to false).
+	AdditionalProperties bool
 }
 
 // For constructs a JSON schema object for the given type argument.
@@ -45,7 +61,10 @@ type ForOptions struct {
 // described below.
 
 // It translates Go types into compatible JSON schema types, as follows.
-// These defaults can be overridden by [ForOptions.TypeSchemas].
+// These defaults can be overridden by [ForOptions.TypeSchemas] or by
+// implementing the [SchemaProvider] interface. [ForOptions.TypeSchemas]
+// takes precedence over [SchemaProvider], which takes precedence over the
+// default translations.
 //
 //   - Strings have schema type "string".
 //   - Bools have schema type "boolean".
@@ -55,7 +74,8 @@ type ForOptions struct {
 //     for items.
 //   - Maps with string key have schema type "object", and corresponding
 //     schema for additionalProperties.
-//   - Structs have schema type "object", and disallow additionalProperties.
+//   - Structs have schema type "object", and disallow additionalProperties
+//     (unless [ForOptions.AdditionalProperties] is true).
 //     Their properties are derived from exported struct fields, using the
 //     struct field JSON name. Fields that are marked "omitempty" or "omitzero" are
 //     considered optional; all other fields become required properties.
@@ -86,7 +106,7 @@ func For[T any](opts *ForOptions) (*Schema, error) {
 	schemas := maps.Clone(initialSchemaMap)
 	// Add types from the options. They override the default ones.
 	maps.Copy(schemas, opts.TypeSchemas)
-	s, err := forType(reflect.TypeFor[T](), map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas)
+	s, err := forType(reflect.TypeFor[T](), map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties)
 	if err != nil {
 		var z T
 		return nil, fmt.Errorf("For[%T](): %w", z, err)
@@ -102,7 +122,7 @@ func ForType(t reflect.Type, opts *ForOptions) (*Schema, error) {
 	schemas := maps.Clone(initialSchemaMap)
 	// Add types from the options. They override the default ones.
 	maps.Copy(schemas, opts.TypeSchemas)
-	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas)
+	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties)
 	if err != nil {
 		return nil, fmt.Errorf("ForType(%s): %w", t, err)
 	}
@@ -114,7 +134,7 @@ func f64Ptr(f float64) *float64 {
 	return &f
 }
 
-func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas map[reflect.Type]*Schema) (*Schema, error) {
+func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas map[reflect.Type]*Schema, additionalProperties bool) (*Schema, error) {
 	// Follow pointers: the schema for *T is almost the same as for T, except that
 	// an explicit JSON "null" is allowed for the pointer.
 	allowNull := false
@@ -144,6 +164,23 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 			}
 		}
 		return cloned, nil
+	}
+
+	// Check if the type implements SchemaProvider.
+	if t.Implements(schemaProviderType) || reflect.PointerTo(t).Implements(schemaProviderType) {
+		s := reflect.New(t).MethodByName("Schema").Call(nil)[0].Interface().(*Schema)
+		if s != nil {
+			cloned := s.CloneSchemas()
+			if os.Getenv(debugEnv) != "typeschemasnull=1" && allowNull {
+				if cloned.Type != "" {
+					cloned.Types = []string{"null", cloned.Type}
+					cloned.Type = ""
+				} else if !slices.Contains(cloned.Types, "null") {
+					cloned.Types = append([]string{"null"}, cloned.Types...)
+				}
+			}
+			return cloned, nil
+		}
 	}
 
 	var (
@@ -208,7 +245,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 		if t.Key().Kind() != reflect.String {
 		}
 		s.Type = "object"
-		s.AdditionalProperties, err = forType(t.Elem(), seen, ignore, schemas)
+		s.AdditionalProperties, err = forType(t.Elem(), seen, ignore, schemas, additionalProperties)
 		if err != nil {
 			return nil, fmt.Errorf("computing map value schema: %v", err)
 		}
@@ -223,7 +260,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 		} else {
 			s.Type = "array"
 		}
-		itemsSchema, err := forType(t.Elem(), seen, ignore, schemas)
+		itemsSchema, err := forType(t.Elem(), seen, ignore, schemas, additionalProperties)
 		if err != nil {
 			return nil, fmt.Errorf("computing element schema: %v", err)
 		}
@@ -245,8 +282,10 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 
 	case reflect.Struct:
 		s.Type = "object"
-		// no additional properties are allowed
-		s.AdditionalProperties = falseSchema()
+		if !additionalProperties {
+			// no additional properties are allowed
+			s.AdditionalProperties = falseSchema()
+		}
 
 		// If skipPath is non-nil, it is path to an anonymous field whose
 		// schema has been replaced by a known schema.
@@ -319,7 +358,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 			if info.omit {
 				continue
 			}
-			fs, err := forType(field.Type, seen, ignore, schemas)
+			fs, err := forType(field.Type, seen, ignore, schemas, additionalProperties)
 			if err != nil {
 				return nil, err
 			}

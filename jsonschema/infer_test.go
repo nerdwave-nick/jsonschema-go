@@ -16,7 +16,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/nerdwave-nick/jsonschema-go/jsonschema"
 )
 
 type custom int
@@ -715,6 +715,155 @@ func TestForWithCycle(t *testing.T) {
 
 func falseSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{Not: &jsonschema.Schema{}}
+}
+
+// providerType implements SchemaProvider with a value receiver.
+type providerType int
+
+func (providerType) Schema() *jsonschema.Schema {
+	return &jsonschema.Schema{Type: "provider-type"}
+}
+
+// ptrProviderType implements SchemaProvider with a pointer receiver.
+type ptrProviderType int
+
+func (*ptrProviderType) Schema() *jsonschema.Schema {
+	return &jsonschema.Schema{Type: "ptr-provider-type"}
+}
+
+func TestSchemaProvider(t *testing.T) {
+	type schema = jsonschema.Schema
+
+	t.Run("value receiver", func(t *testing.T) {
+		got, err := jsonschema.For[providerType](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{Type: "provider-type"}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("pointer receiver", func(t *testing.T) {
+		got, err := jsonschema.For[ptrProviderType](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{Type: "ptr-provider-type"}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("pointer to provider adds null", func(t *testing.T) {
+		got, err := jsonschema.For[*providerType](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{Types: []string{"null", "provider-type"}}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("TypeSchemas takes precedence", func(t *testing.T) {
+		opts := &jsonschema.ForOptions{
+			TypeSchemas: map[reflect.Type]*schema{
+				reflect.TypeFor[providerType](): {Type: "override"},
+			},
+		}
+		got, err := jsonschema.For[providerType](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{Type: "override"}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("struct field with provider", func(t *testing.T) {
+		type S struct {
+			P providerType
+		}
+		got, err := jsonschema.For[S](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{
+			Type: "object",
+			Properties: map[string]*schema{
+				"P": {Type: "provider-type"},
+			},
+			Required:             []string{"P"},
+			AdditionalProperties: falseSchema(),
+			PropertyOrder:        []string{"P"},
+		}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestAdditionalProperties(t *testing.T) {
+	type schema = jsonschema.Schema
+
+	type S struct {
+		A int
+		B string
+	}
+
+	t.Run("default disallows additional properties", func(t *testing.T) {
+		got, err := jsonschema.For[S](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.AdditionalProperties == nil {
+			t.Fatal("expected AdditionalProperties to be set")
+		}
+	})
+
+	t.Run("option allows additional properties", func(t *testing.T) {
+		opts := &jsonschema.ForOptions{AdditionalProperties: true}
+		got, err := jsonschema.For[S](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{
+			Type: "object",
+			Properties: map[string]*schema{
+				"A": {Type: "integer"},
+				"B": {Type: "string"},
+			},
+			Required:      []string{"A", "B"},
+			PropertyOrder: []string{"A", "B"},
+		}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+		if got.AdditionalProperties != nil {
+			t.Fatal("expected AdditionalProperties to be nil")
+		}
+	})
+
+	t.Run("nested structs also allow additional properties", func(t *testing.T) {
+		type Outer struct {
+			Inner S
+		}
+		opts := &jsonschema.ForOptions{AdditionalProperties: true}
+		got, err := jsonschema.For[Outer](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.AdditionalProperties != nil {
+			t.Fatal("expected outer AdditionalProperties to be nil")
+		}
+		inner := got.Properties["Inner"]
+		if inner.AdditionalProperties != nil {
+			t.Fatal("expected inner AdditionalProperties to be nil")
+		}
+	})
 }
 
 func TestDupSchema(t *testing.T) {
