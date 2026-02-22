@@ -106,7 +106,7 @@ func For[T any](opts *ForOptions) (*Schema, error) {
 	schemas := maps.Clone(initialSchemaMap)
 	// Add types from the options. They override the default ones.
 	maps.Copy(schemas, opts.TypeSchemas)
-	s, err := forType(reflect.TypeFor[T](), map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties)
+	s, err := forType(reflect.TypeFor[T](), map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties, false)
 	if err != nil {
 		var z T
 		return nil, fmt.Errorf("For[%T](): %w", z, err)
@@ -122,9 +122,42 @@ func ForType(t reflect.Type, opts *ForOptions) (*Schema, error) {
 	schemas := maps.Clone(initialSchemaMap)
 	// Add types from the options. They override the default ones.
 	maps.Copy(schemas, opts.TypeSchemas)
-	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties)
+	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties, false)
 	if err != nil {
 		return nil, fmt.Errorf("ForType(%s): %w", t, err)
+	}
+	return s, nil
+}
+
+// DefaultFor is like [For], but skips the [SchemaProvider] check for the
+// top-level type. This is intended for use inside a SchemaProvider.Schema
+// implementation to obtain the default reflection-based schema without
+// causing infinite recursion. Nested types that implement [SchemaProvider]
+// are still resolved via their Schema method.
+func DefaultFor[T any](opts *ForOptions) (*Schema, error) {
+	if opts == nil {
+		opts = &ForOptions{}
+	}
+	schemas := maps.Clone(initialSchemaMap)
+	maps.Copy(schemas, opts.TypeSchemas)
+	s, err := forType(reflect.TypeFor[T](), map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties, true)
+	if err != nil {
+		var z T
+		return nil, fmt.Errorf("DefaultFor[%T](): %w", z, err)
+	}
+	return s, nil
+}
+
+// DefaultForType is like [DefaultFor], but takes a [reflect.Type].
+func DefaultForType(t reflect.Type, opts *ForOptions) (*Schema, error) {
+	if opts == nil {
+		opts = &ForOptions{}
+	}
+	schemas := maps.Clone(initialSchemaMap)
+	maps.Copy(schemas, opts.TypeSchemas)
+	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, opts.AdditionalProperties, true)
+	if err != nil {
+		return nil, fmt.Errorf("DefaultForType(%s): %w", t, err)
 	}
 	return s, nil
 }
@@ -134,7 +167,7 @@ func f64Ptr(f float64) *float64 {
 	return &f
 }
 
-func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas map[reflect.Type]*Schema, additionalProperties bool) (*Schema, error) {
+func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas map[reflect.Type]*Schema, additionalProperties bool, skipProvider bool) (*Schema, error) {
 	// Follow pointers: the schema for *T is almost the same as for T, except that
 	// an explicit JSON "null" is allowed for the pointer.
 	allowNull := false
@@ -167,7 +200,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 	}
 
 	// Check if the type implements SchemaProvider.
-	if t.Implements(schemaProviderType) || reflect.PointerTo(t).Implements(schemaProviderType) {
+	if !skipProvider && (t.Implements(schemaProviderType) || reflect.PointerTo(t).Implements(schemaProviderType)) {
 		s := reflect.New(t).MethodByName("Schema").Call(nil)[0].Interface().(*Schema)
 		if s != nil {
 			cloned := s.CloneSchemas()
@@ -245,7 +278,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 		if t.Key().Kind() != reflect.String {
 		}
 		s.Type = "object"
-		s.AdditionalProperties, err = forType(t.Elem(), seen, ignore, schemas, additionalProperties)
+		s.AdditionalProperties, err = forType(t.Elem(), seen, ignore, schemas, additionalProperties, false)
 		if err != nil {
 			return nil, fmt.Errorf("computing map value schema: %v", err)
 		}
@@ -260,7 +293,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 		} else {
 			s.Type = "array"
 		}
-		itemsSchema, err := forType(t.Elem(), seen, ignore, schemas, additionalProperties)
+		itemsSchema, err := forType(t.Elem(), seen, ignore, schemas, additionalProperties, false)
 		if err != nil {
 			return nil, fmt.Errorf("computing element schema: %v", err)
 		}
@@ -358,7 +391,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 			if info.omit {
 				continue
 			}
-			fs, err := forType(field.Type, seen, ignore, schemas, additionalProperties)
+			fs, err := forType(field.Type, seen, ignore, schemas, additionalProperties, false)
 			if err != nil {
 				return nil, err
 			}

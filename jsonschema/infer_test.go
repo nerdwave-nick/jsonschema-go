@@ -731,6 +731,24 @@ func (*ptrProviderType) Schema() *jsonschema.Schema {
 	return &jsonschema.Schema{Type: "ptr-provider-type"}
 }
 
+// defaultForProvider uses DefaultFor inside its Schema() method,
+// mimicking the real-world pattern of augmenting the default schema.
+type defaultForProvider struct {
+	Name string
+	Age  int
+}
+
+func (*defaultForProvider) Schema() *jsonschema.Schema {
+	s, err := jsonschema.DefaultFor[defaultForProvider](nil)
+	if err != nil {
+		panic(err)
+	}
+	typeConst := any("defaultForProvider")
+	s.Properties["type"] = &jsonschema.Schema{Type: "string", Const: &typeConst}
+	s.Required = append([]string{"type"}, s.Required...)
+	return s
+}
+
 func TestSchemaProvider(t *testing.T) {
 	type schema = jsonschema.Schema
 
@@ -788,6 +806,72 @@ func TestSchemaProvider(t *testing.T) {
 			P providerType
 		}
 		got, err := jsonschema.For[S](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &schema{
+			Type: "object",
+			Properties: map[string]*schema{
+				"P": {Type: "provider-type"},
+			},
+			Required:             []string{"P"},
+			AdditionalProperties: falseSchema(),
+			PropertyOrder:        []string{"P"},
+		}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestDefaultFor(t *testing.T) {
+	type schema = jsonschema.Schema
+
+	t.Run("no infinite recursion", func(t *testing.T) {
+		got, err := jsonschema.For[defaultForProvider](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The Schema() method adds a "type" property with a const value.
+		typeConst := any("defaultForProvider")
+		want := &schema{
+			Type: "object",
+			Properties: map[string]*schema{
+				"Name": {Type: "string"},
+				"Age":  {Type: "integer"},
+				"type": {Type: "string", Const: &typeConst},
+			},
+			Required:             []string{"type", "Name", "Age"},
+			AdditionalProperties: falseSchema(),
+			PropertyOrder:        []string{"Name", "Age"},
+		}
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreUnexported(schema{})); diff != "" {
+			t.Fatalf("mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("pointer adds null", func(t *testing.T) {
+		got, err := jsonschema.For[*defaultForProvider](nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Should have null in types since it's a pointer.
+		if len(got.Types) == 0 {
+			t.Fatal("expected Types to include null")
+		}
+		if got.Types[0] != "null" {
+			t.Fatalf("expected first type to be null, got %q", got.Types[0])
+		}
+	})
+
+	t.Run("nested provider still resolved", func(t *testing.T) {
+		// A struct containing a field whose type implements SchemaProvider.
+		// DefaultFor skips the provider only for the top-level type;
+		// nested types should still use SchemaProvider.
+		type Outer struct {
+			P providerType
+		}
+		got, err := jsonschema.DefaultFor[Outer](nil)
 		if err != nil {
 			t.Fatal(err)
 		}
